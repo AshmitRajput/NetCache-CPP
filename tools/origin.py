@@ -6,8 +6,19 @@ Well-behaved endpoints:
   /size?n=N           N bytes of 'x'
   /slow?ms=N          sleeps N ms, then replies
   /status?code=N      204 / 304 / 404 / 500 with the right framing
-  /__counts           JSON: how many times each path was served (not itself counted)
+  /hdr?...            configurable response for cache tests (see below)
+  /__counts           JSON: how many times each path+query was served (not itself counted)
   /__reset            clears the counters
+
+/hdr query parameters (all optional):
+  cc=...        Cache-Control header value        vary=...     Vary header value
+  expires=...   Expires header value              age=N        Age header
+  pragma=...    Pragma header                     cookie=1     adds Set-Cookie
+  status=N      status code (default 200)         size=N       body size in bytes (default 64)
+  ms=N          delay before replying             fail=truncate|reset  break the response after the delay
+  etag=...      ETag header                       v=...        free-form, only to make keys unique
+  The body is "<path+query> #<n>" padded to `size` where n counts how many times THIS key was generated,
+  so two responses with the same body prove the second was served from the cache.
 
 Deliberately broken endpoints (used by the integration tests):
   /chunked            valid chunked response
@@ -52,6 +63,37 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
         self.close_connection = True
 
+    def _hdr(self, q, nth):
+        one = lambda k, d=None: q.get(k, [d])[0]
+        ms = int(one("ms", "0"))
+        if ms:
+            time.sleep(ms / 1000)
+        fail = one("fail")
+        if fail == "truncate":
+            return self._raw(b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 100\r\n\r\n0123456789")
+        if fail == "reset":
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n0123456789")
+            self.wfile.flush()
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            self.connection.close()
+            self.close_connection = True
+            return
+        status = int(one("status", "200"))
+        text = f"{self.path} #{nth} ".encode()
+        size = int(one("size", "64"))
+        body = (text + b"." * max(0, size - len(text)))[:max(size, len(text))] if size >= len(text) else text
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain")
+        for hdr, key in (("Cache-Control", "cc"), ("Vary", "vary"), ("Expires", "expires"), ("Age", "age"),
+                         ("Pragma", "pragma"), ("ETag", "etag")):
+            if one(key) is not None:
+                self.send_header(hdr, one(key))
+        if one("cookie"):
+            self.send_header("Set-Cookie", "sid=1")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         url = urlsplit(self.path)
         q = parse_qs(url.query)
@@ -66,7 +108,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, b"ok")
 
         with LOCK:
-            COUNTS[path] = COUNTS.get(path, 0) + 1
+            COUNTS[self.path] = COUNTS.get(self.path, 0) + 1
+            nth = COUNTS[self.path]
+
+        if path == "/hdr":
+            return self._hdr(q, nth)
 
         if path == "/hello":
             return self._send(200, b"hello from origin\n")
@@ -106,6 +152,13 @@ class Handler(BaseHTTPRequestHandler):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 256
+
+    def handle_error(self, request, client_address):
+        # Clients (the proxy) legitimately hang up on slow/broken responses; don't spam tracebacks.
+        import sys
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
 
 
 def main():

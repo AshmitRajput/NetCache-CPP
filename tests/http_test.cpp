@@ -260,4 +260,46 @@ TEST(error_response_is_well_formed) {
     CHECK(out.find("Content-Length: " + std::to_string(body.size()) + "\r\n") != std::string::npos);
 }
 
+// ------------------------------------------------------ setResponseHeader (Phase 2B)
+
+TEST(set_response_header_inserts_after_status_line_and_keeps_body_verbatim) {
+    std::string in = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nX-A: 1\r\nConnection: close\r\n\r\nbody";
+    CHECK_EQ(setResponseHeader(in, "X-Cache", "HIT"),
+             std::string("HTTP/1.1 200 OK\r\nX-Cache: HIT\r\nContent-Length: 4\r\nX-A: 1\r\nConnection: close\r\n\r\nbody"));
+}
+
+TEST(set_response_header_replaces_existing_case_insensitively_everywhere) {
+    std::string in = "HTTP/1.1 200 OK\r\nx-cache: upstream\r\nA: b\r\nX-CACHE: again\r\nContent-Length: 0\r\n\r\n";
+    std::string out = setResponseHeader(in, "X-Cache", "MISS");
+    CHECK_EQ(out, std::string("HTTP/1.1 200 OK\r\nX-Cache: MISS\r\nA: b\r\nContent-Length: 0\r\n\r\n"));
+}
+
+TEST(set_response_header_does_not_touch_body_that_looks_like_headers) {
+    std::string in = "HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nX-Cache: bogus\r\n\r\nzz";
+    std::string out = setResponseHeader(in, "X-Cache", "HIT");
+    CHECK(out.size() >= 2 && out.substr(out.size() - 20) == std::string("X-Cache: bogus\r\n\r\nzz"));
+    CHECK(out.find("X-Cache: HIT\r\n") != std::string::npos);
+}
+
+TEST(set_response_header_works_with_no_other_headers_and_is_idempotent) {
+    std::string in = "HTTP/1.1 200 OK\r\n\r\nbody";
+    std::string once = setResponseHeader(in, "X-Cache", "HIT");
+    CHECK_EQ(once, std::string("HTTP/1.1 200 OK\r\nX-Cache: HIT\r\n\r\nbody"));
+    CHECK_EQ(setResponseHeader(once, "X-Cache", "HIT"), once);
+}
+
+TEST(set_response_header_leaves_malformed_input_alone) {
+    CHECK_EQ(setResponseHeader("not a response", "X-Cache", "HIT"), std::string("not a response"));
+}
+
+TEST(round_trip_through_client_response_builder_is_parseable) {
+    auto r = parseResponseHead(resp("HTTP/1.1 200 OK", "Content-Length: 2\r\n"));
+    CHECK(r.state == ParseState::Complete);
+    std::string stamped = setResponseHeader(buildClientResponse(r.head, "hi"), "X-Cache", "MISS");
+    auto again = parseResponseHead(stamped);
+    CHECK(again.state == ParseState::Complete);
+    CHECK_EQ(again.head.contentLength, size_t(2));
+    CHECK_EQ(stamped.substr(stamped.size() - 2), std::string("hi"));
+}
+
 int main() { return th::runAll(); }
