@@ -80,6 +80,12 @@ std::string buildUpstreamRequest(const Request& request, std::string_view upstre
 // Framing headers (Content-Length) are preserved exactly, never rewritten.
 std::string buildClientResponse(const ResponseHead& head, std::string_view body);
 
+// Returns `response` (a complete response WE generated: head + body) with every existing header
+// called `name` removed and `name: value` inserted right after the status line. Used to stamp
+// X-Cache. Only the head is touched; the body bytes are copied verbatim. If the input has no
+// CRLF CRLF head terminator it is returned unchanged.
+std::string setResponseHeader(std::string_view response, std::string_view name, std::string_view value);
+
 // Minimal generated error response with a fixed body (no upstream detail leaks).
 std::string buildErrorResponse(int status);
 

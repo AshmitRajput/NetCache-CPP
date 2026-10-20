@@ -1,4 +1,4 @@
-// NetCache, Phase 1: hardened forwarding proxy (no caching yet).
+// NetCache, Phase 2B: hardened forwarding proxy + bounded LRU cache + per-key request coalescing.
 //
 // Threading model: one acceptor (main thread) -> bounded queue -> fixed pool of workers.
 // Each worker owns one connection end to end. All sockets are non-blocking and every wait
@@ -6,6 +6,9 @@
 // longer than the configured timeouts (slowloris mitigation).
 // Linux only (accept4, MSG_NOSIGNAL).
 
+#include "cache.hpp"
+#include "cache_policy.hpp"
+#include "coalescing_cache.hpp"
 #include "http.hpp"
 
 #include <arpa/inet.h>
@@ -17,6 +20,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <climits>
@@ -25,13 +29,16 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <deque>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -56,6 +63,14 @@ struct Config {
     unsigned upstreamTimeoutMs = 10000;  // connect + send + full response
     unsigned writeTimeoutMs = 10000;     // sending the response to the client
     size_t maxResponseBytes = 1024 * 1024;
+    // Phase 2B
+    size_t cacheBytes = 16 * 1024 * 1024;       // payload budget; 0 disables the cache entirely
+    size_t cacheEntryBytes = 2 * 1024 * 1024;   // largest stored (serialized) response
+    unsigned defaultTtlS = 60;                  // when the response has no Cache-Control; 0 = require max-age
+    unsigned maxTtlS = 3600;
+    unsigned coalesceWaitMs = 0;                // 0 = upstream timeout + 2000
+    bool enableStats = false;
+    bool coalesce = true;
 };
 
 void printUsage(const char* prog) {
@@ -70,7 +85,14 @@ void printUsage(const char* prog) {
                  "  --request-timeout-ms N   (default 5000)\n"
                  "  --upstream-timeout-ms N  (default 10000)\n"
                  "  --write-timeout-ms N     (default 10000)\n"
-                 "  --max-response-bytes N   (default 1048576)\n",
+                 "  --max-response-bytes N   (default 1048576)\n"
+                 "  --cache-bytes N          cache payload budget in bytes; 0 disables caching (default 16777216)\n"
+                 "  --cache-entry-bytes N    largest cacheable stored response (default 2097152)\n"
+                 "  --default-ttl-s N        TTL when no Cache-Control; 0 = only cache explicit max-age (default 60)\n"
+                 "  --max-ttl-s N            clamp for any TTL (default 3600)\n"
+                 "  --coalesce-wait-ms N     max time a request waits for another's fetch (default upstream timeout + 2000)\n"
+                 "  --no-coalesce            disable request coalescing (for experiments)\n"
+                 "  --enable-stats           serve JSON counters at /__netcache/stats (off by default)\n",
                  prog);
 }
 
@@ -124,6 +146,25 @@ bool parseArgs(int argc, char** argv, Config& cfg) {
         } else if (a == "--max-response-bytes") {
             ok = parseUint(next(), 1, 1ULL << 30, v);
             cfg.maxResponseBytes = static_cast<size_t>(v);
+        } else if (a == "--cache-bytes") {
+            ok = parseUint(next(), 0, 1ULL << 36, v);
+            cfg.cacheBytes = static_cast<size_t>(v);
+        } else if (a == "--cache-entry-bytes") {
+            ok = parseUint(next(), 1, 1ULL << 30, v);
+            cfg.cacheEntryBytes = static_cast<size_t>(v);
+        } else if (a == "--default-ttl-s") {
+            ok = parseUint(next(), 0, 86400 * 365, v);
+            cfg.defaultTtlS = static_cast<unsigned>(v);
+        } else if (a == "--max-ttl-s") {
+            ok = parseUint(next(), 1, 86400 * 365, v);
+            cfg.maxTtlS = static_cast<unsigned>(v);
+        } else if (a == "--coalesce-wait-ms") {
+            ok = parseUint(next(), 50, 3600000, v);
+            cfg.coalesceWaitMs = static_cast<unsigned>(v);
+        } else if (a == "--no-coalesce") {
+            cfg.coalesce = false;
+        } else if (a == "--enable-stats") {
+            cfg.enableStats = true;
         } else {
             std::fprintf(stderr, "unknown option: %s\n", a.c_str());
             return false;
@@ -298,6 +339,13 @@ struct UpstreamContext {
     Config cfg;
     std::vector<ResolvedAddr> addrs;
     std::string authority;  // value of the Host header sent upstream
+    // Phase 2B. cache/fetcher are null when --cache-bytes 0 (every request is then a BYPASS).
+    netcache::CachePolicyConfig policy;
+    std::unique_ptr<netcache::Cache> cache;
+    std::unique_ptr<netcache::CoalescingCache> fetcher;
+    std::chrono::milliseconds coalesceWait{12000};
+    std::atomic<std::uint64_t> bypasses{0};
+    std::atomic<std::uint64_t> requests{0};
 };
 
 // The whole response is buffered and validated BEFORE anything is sent to the client, so a
@@ -406,7 +454,52 @@ void logLine(const std::string& target, int status, long long ms, const std::str
                  detail.empty() ? "" : " | ", detail.c_str());
 }
 
-void handleConnection(int rawFd, const UpstreamContext& up) {
+// Cache key: everything that selects the response. The fixed upstream authority is included for
+// clarity; the target is used exactly as received (never decoded or normalised); the Accept value
+// is part of the key because it is the one client header we forward, and an origin may vary on it
+// without saying so. '|' can appear inside a target, so the target is placed last and Accept is
+// length-prefixed; that keeps the key unambiguous.
+std::string cacheKey(const UpstreamContext& up, const netcache::http::Request& r) {
+    std::string accept;
+    int count = 0;
+    for (const auto& h : r.headers) {
+        std::string n = h.name;
+        for (char& c : n) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (n == "accept") {
+            accept = h.value;
+            ++count;
+        }
+    }
+    if (count != 1) accept.clear();  // duplicate Accept is not forwarded upstream, so it cannot select anything
+    return "GET|" + up.authority + "|" + std::to_string(accept.size()) + ":" + accept + "|" + r.target;
+}
+
+int statusOfSerialized(const std::string& response) {  // "HTTP/1.1 NNN ..."
+    if (response.size() < 12) return 0;
+    return std::atoi(response.substr(9, 3).c_str());
+}
+
+std::string statsResponse(const UpstreamContext& up) {
+    netcache::Cache::Stats cs{};
+    netcache::CoalescerCounters c{};
+    if (up.cache) cs = up.cache->stats();
+    if (up.fetcher) c = up.fetcher->counters();
+    auto n = [](std::uint64_t v) { return std::to_string(v); };
+    std::string body = "{\"requests\":" + n(up.requests) + ",\"bypassed_requests\":" + n(up.bypasses) +
+                       ",\"cache_enabled\":" + (up.cache ? "true" : "false") +
+                       ",\"coalescing\":" + (up.cfg.coalesce ? "true" : "false") +
+                       ",\"hits\":" + n(c.hits) + ",\"miss_stored\":" + n(c.miss_stored) +
+                       ",\"miss_uncacheable\":" + n(c.miss_uncacheable) + ",\"coalesced\":" + n(c.coalesced) +
+                       ",\"upstream_failures\":" + n(c.upstream_failures) +
+                       ",\"upstream_timeouts\":" + n(c.upstream_timeouts) + ",\"wait_timeouts\":" + n(c.wait_timeouts) +
+                       ",\"cancelled\":" + n(c.cancelled) + ",\"upstream_fetches\":" + n(c.fetches_started) +
+                       ",\"entries\":" + n(cs.entries) + ",\"payload_bytes\":" + n(cs.payload_bytes) +
+                       ",\"max_bytes\":" + n(cs.max_bytes) + ",\"max_entry_bytes\":" + n(cs.max_entry_bytes) + "}\n";
+    return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: " +
+           std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+}
+
+void handleConnection(int rawFd, UpstreamContext& up) {
     namespace http = netcache::http;
     FdGuard client(rawFd);
     const Config& cfg = up.cfg;
@@ -443,25 +536,95 @@ void handleConnection(int rawFd, const UpstreamContext& up) {
         return;
     }
 
-    // 2. Forward and relay.
-    FetchResult fr = fetchUpstream(up, pr.request);
-    switch (fr.status) {
-        case FetchStatus::Ok:
-            reply(http::buildClientResponse(fr.head, fr.body));
-            logLine(pr.request.target, fr.head.status, elapsedMs(), "");
+    // 2. Local endpoints. Anything under /__netcache/ is never forwarded.
+    constexpr std::string_view kLocalPrefix = "/__netcache/";
+    if (std::string_view(pr.request.target).substr(0, kLocalPrefix.size()) == kLocalPrefix) {
+        if (cfg.enableStats && pr.request.target == "/__netcache/stats") {
+            reply(statsResponse(up));
+            logLine(pr.request.target, 200, elapsedMs(), "stats");
+        } else {
+            reply(http::buildErrorResponse(404));
+            logLine(pr.request.target, 404, elapsedMs(), "local path");
+        }
+        return;
+    }
+    ++up.requests;
+
+    // 3. Forward / cache. One fetch callback serves every path: it fetches, serializes the client
+    //    response once, and decides cacheability with the pure policy function.
+    auto fetchFn = [&]() -> netcache::Fetched {
+        FetchResult fr = fetchUpstream(up, pr.request);
+        netcache::Fetched f;
+        f.detail = fr.detail;
+        switch (fr.status) {
+            case FetchStatus::Ok: {
+                auto payload = std::make_shared<const std::string>(http::buildClientResponse(fr.head, fr.body));
+                netcache::CacheDecision d = netcache::evaluateResponse(fr.head, payload->size(), up.policy);
+                f.status = netcache::Fetched::Status::Ok;
+                f.payload = std::move(payload);
+                f.cacheable = d.cacheable;
+                f.ttl = std::chrono::duration_cast<netcache::Cache::Duration>(d.ttl);
+                f.detail = d.reason;
+                break;
+            }
+            case FetchStatus::Timeout: f.status = netcache::Fetched::Status::Timeout; break;
+            case FetchStatus::Failure: f.status = netcache::Fetched::Status::UpstreamError; break;
+        }
+        return f;
+    };
+
+    netcache::LookupResult lr;
+    std::string label;  // X-Cache value
+    std::string bypassReason;
+    if (!up.fetcher || netcache::requestBypassesCache(pr.request, &bypassReason)) {
+        ++up.bypasses;
+        netcache::Fetched f = fetchFn();
+        switch (f.status) {
+            case netcache::Fetched::Status::Ok: lr.outcome = netcache::Outcome::MissUncacheable; lr.payload = f.payload; break;
+            case netcache::Fetched::Status::Timeout: lr.outcome = netcache::Outcome::UpstreamTimeout; break;
+            case netcache::Fetched::Status::UpstreamError: lr.outcome = netcache::Outcome::UpstreamFailure; break;
+        }
+        lr.detail = f.detail;
+        label = "BYPASS";
+        if (!bypassReason.empty()) lr.detail = bypassReason;
+    } else {
+        lr = up.fetcher->getOrFetch(cacheKey(up, pr.request), fetchFn, up.coalesceWait);
+        switch (lr.outcome) {
+            case netcache::Outcome::Hit: label = "HIT"; break;
+            case netcache::Outcome::MissStored: label = "MISS"; break;
+            case netcache::Outcome::MissUncacheable: label = "BYPASS"; break;
+            case netcache::Outcome::Coalesced: label = "COALESCED"; break;
+            default: break;
+        }
+    }
+
+    // 4. Map every outcome explicitly (no default branch: the compiler flags a missed enumerator).
+    switch (lr.outcome) {
+        case netcache::Outcome::Hit:
+        case netcache::Outcome::MissStored:
+        case netcache::Outcome::MissUncacheable:
+        case netcache::Outcome::Coalesced:
+            reply(http::setResponseHeader(*lr.payload, "X-Cache", label));
+            logLine(pr.request.target, statusOfSerialized(*lr.payload), elapsedMs(),
+                    label + (lr.detail.empty() ? "" : " " + lr.detail));
             break;
-        case FetchStatus::Timeout:
+        case netcache::Outcome::UpstreamTimeout:
+        case netcache::Outcome::WaitTimeout:
             reply(http::buildErrorResponse(504));
-            logLine(pr.request.target, 504, elapsedMs(), fr.detail);
+            logLine(pr.request.target, 504, elapsedMs(), std::string(netcache::outcomeName(lr.outcome)) + " " + lr.detail);
             break;
-        case FetchStatus::Failure:
+        case netcache::Outcome::UpstreamFailure:
             reply(http::buildErrorResponse(502));
-            logLine(pr.request.target, 502, elapsedMs(), fr.detail);
+            logLine(pr.request.target, 502, elapsedMs(), lr.detail);
+            break;
+        case netcache::Outcome::Cancelled:
+            reply(http::buildErrorResponse(503));
+            logLine(pr.request.target, 503, elapsedMs(), "shutting down");
             break;
     }
 }
 
-void workerLoop(BoundedQueue& queue, const UpstreamContext& up) {
+void workerLoop(BoundedQueue& queue, UpstreamContext& up) {
     while (auto fd = queue.pop()) {
         try {
             handleConnection(*fd, up);
@@ -539,6 +702,19 @@ int main(int argc, char** argv) {
         return 1;
     }
     up.authority = formatAuthority(cfg.upstreamHost, cfg.upstreamPort);
+    up.policy.default_ttl = std::chrono::seconds(cfg.defaultTtlS);
+    up.policy.max_ttl = std::chrono::seconds(cfg.maxTtlS);
+    up.policy.max_entry_bytes = std::min(cfg.cacheEntryBytes, cfg.cacheBytes);
+    up.coalesceWait = Ms(cfg.coalesceWaitMs != 0 ? cfg.coalesceWaitMs : cfg.upstreamTimeoutMs + 2000);
+    if (cfg.cacheBytes > 0) {
+        netcache::Cache::Config cc;
+        cc.max_bytes = cfg.cacheBytes;
+        cc.max_entry_bytes = cfg.cacheEntryBytes;
+        up.cache = std::make_unique<netcache::Cache>(cc);
+        netcache::CoalescingCache::Options co;
+        co.coalesce = cfg.coalesce;
+        up.fetcher = std::make_unique<netcache::CoalescingCache>(*up.cache, co);
+    }
 
     // No SA_RESTART: signals must interrupt poll() so shutdown is prompt.
     struct sigaction sa{};
@@ -554,10 +730,11 @@ int main(int argc, char** argv) {
     BoundedQueue queue(cfg.queueCapacity);
     std::vector<std::thread> workers;
     workers.reserve(cfg.workers);
-    for (size_t i = 0; i < cfg.workers; ++i) workers.emplace_back(workerLoop, std::ref(queue), std::cref(up));
+    for (size_t i = 0; i < cfg.workers; ++i) workers.emplace_back(workerLoop, std::ref(queue), std::ref(up));
 
-    std::fprintf(stderr, "netcache listening on %s:%u -> %s (%zu workers, queue %zu)\n", cfg.bindAddress.c_str(),
-                 static_cast<unsigned>(cfg.listenPort), up.authority.c_str(), cfg.workers, cfg.queueCapacity);
+    std::fprintf(stderr, "netcache listening on %s:%u -> %s (%zu workers, queue %zu, cache %zu B, coalescing %s)\n",
+                 cfg.bindAddress.c_str(), static_cast<unsigned>(cfg.listenPort), up.authority.c_str(), cfg.workers,
+                 cfg.queueCapacity, cfg.cacheBytes, cfg.coalesce ? "on" : "off");
 
     while (!g_stop) {
         pollfd p{listener.get(), POLLIN, 0};
@@ -582,6 +759,7 @@ int main(int argc, char** argv) {
 
     std::fprintf(stderr, "shutting down: draining queued connections\n");
     queue.close();
+    if (up.fetcher) up.fetcher->shutdown();  // wake coalesced waiters; no new upstream fetches while draining
     for (auto& t : workers) t.join();
     return 0;
 }

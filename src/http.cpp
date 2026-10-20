@@ -350,6 +350,30 @@ std::string buildClientResponse(const ResponseHead& head, std::string_view body)
     return out;
 }
 
+std::string setResponseHeader(std::string_view response, std::string_view name, std::string_view value) {
+    size_t headEnd = response.find("\r\n\r\n");
+    size_t lineEnd = response.find("\r\n");
+    if (headEnd == std::string_view::npos || lineEnd == std::string_view::npos) return std::string(response);
+    std::string lname = toLower(name);
+
+    std::string out(response.substr(0, lineEnd + 2));
+    out += std::string(name) + ": " + std::string(value) + "\r\n";
+    size_t pos = lineEnd + 2;
+    while (pos < headEnd + 2) {  // each header line ends in CRLF; headEnd + 2 is the final line's CRLF end
+        size_t eol = response.find("\r\n", pos);
+        std::string_view line = response.substr(pos, eol - pos);
+        size_t colon = line.find(':');
+        bool same = colon != std::string_view::npos && toLower(line.substr(0, colon)) == lname;
+        if (!same) {
+            out.append(line);
+            out += "\r\n";
+        }
+        pos = eol + 2;
+    }
+    out.append(response.substr(headEnd + 2));  // the blank line (CRLF) and the body
+    return out;
+}
+
 std::string buildErrorResponse(int status) {
     std::string body = std::to_string(status) + " " + reasonPhrase(status) + "\n";
     std::string out = "HTTP/1.1 " + std::to_string(status) + " " + reasonPhrase(status) + "\r\n";
@@ -367,6 +391,7 @@ const char* reasonPhrase(int status) {
         case 204: return "No Content";
         case 304: return "Not Modified";
         case 400: return "Bad Request";
+        case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 408: return "Request Timeout";
         case 414: return "URI Too Long";
