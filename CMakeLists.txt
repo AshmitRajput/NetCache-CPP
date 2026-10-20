@@ -23,7 +23,7 @@ add_library(netcache_http STATIC src/http.cpp)
 target_include_directories(netcache_http PUBLIC src)
 
 # Phase 2A/2B: bounded LRU cache + single-flight coalescing (no HTTP, no sockets).
-add_library(netcache_cache STATIC src/cache.cpp src/coalescing_cache.cpp)
+add_library(netcache_cache STATIC src/cache.cpp src/eviction.cpp src/coalescing_cache.cpp)
 target_include_directories(netcache_cache PUBLIC src)
 target_link_libraries(netcache_cache PUBLIC Threads::Threads)
 
@@ -42,6 +42,10 @@ add_test(NAME http_unit COMMAND http_test)
 add_executable(cache_test tests/cache_test.cpp)
 target_link_libraries(cache_test PRIVATE netcache_cache)
 add_test(NAME cache_unit COMMAND cache_test)
+
+add_executable(eviction_test tests/eviction_test.cpp)
+target_link_libraries(eviction_test PRIVATE netcache_cache)
+add_test(NAME eviction_unit COMMAND eviction_test)
 
 add_executable(coalescing_test tests/coalescing_test.cpp)
 target_link_libraries(coalescing_test PRIVATE netcache_cache)

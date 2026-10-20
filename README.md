@@ -1,23 +1,23 @@
 # NetCache
 
 A small HTTP/1.1 caching proxy in C++17 with a deliberately narrow scope: `GET` only, one fixed
-upstream, `Content-Length` framing, bounded cache memory. The goal is correctness you can explain, not
+upstream, strict `Content-Length`/decoded chunked framing, bounded cache memory. The goal is correctness you can explain, not
 feature count.
 
-**Status: Phase 2 of 3 complete (bounded LRU cache + request coalescing, wired into the proxy).**
+**Status: Phase 3 complete (strict chunked forwarding, policy-based eviction, and benchmark support).**
 
 | Phase | Delivers | State |
 |---|---|---|
 | 1 | Hardened TCP/HTTP forwarding proxy, worker pool, load shedding, strict parser | done |
 | 2A | Standalone bounded thread-safe LRU cache (`src/cache.*`), injectable clock | done |
 | 2B | Proxy integration, eligibility rules, per-key request coalescing, opt-in stats | done |
-| 3 | Chunked forwarding (uncached), cost-aware eviction, reproducible benchmarks | planned |
+| 3 | Chunked forwarding (uncached), cost-aware eviction, reproducible benchmarks | done |
 
 ## Build and test
 
 ```sh
 cmake -S . -B build && cmake --build build -j
-ctest --test-dir build --output-on-failure        # 4 unit suites + integration (Python)
+ctest --test-dir build --output-on-failure        # 5 unit suites + integration (Python)
 
 # Sanitizers
 cmake -S . -B build-asan -DNETCACHE_SANITIZE=address,undefined && cmake --build build-asan -j
@@ -32,6 +32,8 @@ cmake -S . -B build-tsan -DNETCACHE_SANITIZE=thread           && cmake --build b
 python3 tools/origin.py --port 9000 &
 ./build/netcache --port 8080 --upstream-port 9000
 curl -i http://127.0.0.1:8080/hello
+# Compare a seeded workload with the default LRU or --eviction cost-aware:
+python3 tools/bench.py --port 8080 --seed 20261020
 ```
 
 `./build/netcache --help` lists every option. Cache-related ones:
@@ -44,6 +46,7 @@ curl -i http://127.0.0.1:8080/hello
 | `--max-ttl-s N` | 3600 | clamp applied to every TTL |
 | `--coalesce-wait-ms N` | upstream timeout + 2000 | longest a request waits for another request's fetch |
 | `--no-coalesce` | off | disable coalescing (control experiment) |
+| `--eviction KIND` | `lru` | choose `lru` or `cost-aware` eviction |
 | `--enable-stats` | off | serve JSON counters at `/__netcache/stats` |
 
 Every response that came through the cache path carries one `X-Cache` header:
@@ -90,10 +93,11 @@ Statuses: 400/405/408/414/417/431/501/505.
 **Upstream request** is rebuilt from scratch: fixed `Host`, `Connection: close`, and at most one
 client `Accept`. Cookies, `Authorization`, `Accept-Encoding`, etc. are never forwarded.
 
-**Upstream response:** exactly one valid `Content-Length` (or 204/304), within
-`--max-response-bytes`. Anything else, including `Transfer-Encoding`, 1xx, duplicate or conflicting
-framing, truncated bodies, and garbage status lines, yields `502` (`504` on timeout). Hop-by-hop
-headers are stripped; `Content-Length` is never rewritten. Extra bytes after the body are dropped.
+**Upstream response:** exactly one valid `Content-Length`, one strict `Transfer-Encoding: chunked`,
+or 204/304, within `--max-response-bytes`. Chunk extensions, trailers, duplicate or conflicting
+framing, truncated bodies, and garbage status lines yield `502` (`504` on timeout). Chunked bodies
+are decoded and sent with a generated `Content-Length`; they are never cached. Hop-by-hop headers
+are stripped and extra bytes after a complete body are dropped.
 
 ## Cache engine (`src/cache.hpp/.cpp`)
 
@@ -110,13 +114,14 @@ Opaque `key -> payload` store; it does no HTTP parsing and makes no cacheability
   expired when `now >= deadline`; a rejected `put` still removes any old value under that key
   (never leave stale data readable after a failed update); huge TTLs saturate rather than overflow.
 * Eviction: when a new entry does not fit, expired entries are reaped first (one O(n) sweep, only
-  on that path), then LRU entries are evicted until it fits.
+  on that path), then the configured policy evicts entries until it fits. `LruPolicy` is the default;
+  `CostAwarePolicy` scores recency, measured fetch cost, and payload size with deterministic ties.
 * Complexity: `get`/`erase` O(1) average; `put` O(1) average plus O(k) for k evictions.
 
 Limitations of the store: the budget counts **payload bytes only** (keys, list/map nodes and allocator overhead
 are extra, so many tiny entries use far more RAM than `max_bytes`); expiry is lazy (dead entries
 hold budget until looked up or swept); `get` copies the payload; one global lock; no stale
-serving or cost-aware eviction yet. What is stored is the complete serialized client response
+serving. What is stored is the complete serialized client response
 (status line + headers + body), so headers count against the budget.
 
 ## Caching rules (`src/cache_policy.*`)
@@ -191,6 +196,31 @@ with the LRU victim chosen correctly; owner failure (truncated and reset upstrea
 all 20/10 waiters with 502/504 and release the key; cached entries survive the origin being killed; SIGTERM
 with waiters in flight exits promptly.
 
+## Measured Phase 3 benchmark
+
+The following numbers were measured on 2026-10-20 in the Linux build using
+`tools/bench.py`, three seeded runs per configuration, 200 sequential requests per run, 20 keys,
+64 workers, a 5,000-byte cache budget, and a 1,000-byte per-entry limit. The origin and proxy ran
+locally in the same Linux environment; these are comparative application measurements, not
+cross-machine production capacity claims.
+
+| Configuration | Mean latency | p95 latency | Serial-equivalent req/s* | Cache hits | Errors |
+|---|---:|---:|---:|---:|---:|
+| LRU | 0.522 ms | 1.219–1.846 ms | ~1,916 | 531/600 (88.5%) | 0 |
+| Cost-aware | 0.448 ms | 1.008–1.701 ms | ~2,232 | 538/600 (89.7%) | 0 |
+| LRU, coalescing disabled | 0.557 ms | 1.487–1.972 ms | ~1,795 | 531/600 (88.5%) | 0 |
+| Cache disabled | 1.267 ms | 1.640–1.927 ms | ~789 | 0/600 (0%) | 0 |
+
+Across the three runs, cached LRU traffic was approximately 2.4x faster by mean latency than the
+cache-disabled control. The cost-aware result was directionally better in this workload, but the
+workload did not vary upstream fetch cost enough to establish a general policy advantage; treat the
+policy comparison as an implementation demonstration, not a statistically significant benchmark.
+The benchmark reports `mean_ms`, `p95_ms`, labels, request count, seed, and failures as JSON so the
+same workload can be reproduced with `--seed`.
+
+\* `req/s` is the reciprocal of mean per-request latency for this sequential benchmark
+(`1000 / mean_ms`); it is not a concurrent throughput ceiling.
+
 Seeded-bug check on `coalescing_cache.cpp` (6 mutants): no cache re-check before becoming owner, no
 `notify_all`, in-flight record never erased, exceptions escaping the fetch, "stored" reported without
 storing, waiter count never decremented. Each is caught (the missing `notify_all` shows up as a hang/timeout,
@@ -198,7 +228,9 @@ the escaping exception as an abort). The first run showed the re-check mutant *s
 `owner_finishing_between_first_lookup_and_registration_is_not_refetched` and its test seam
 (`Options::after_first_miss`) exist.
 
-Not run: `cmake`/`ctest`, IPv6, non-Python origins, any benchmark (Phase 3).
+Validation completed in the Linux toolchain: CMake build, all five unit executables, and the Python
+integration suite passed. The benchmark harness was run for LRU, cost-aware, no-coalescing, and
+cache-disabled controls. IPv6 and non-Python origins remain untested.
 
 ## Known limitations (honest list)
 
@@ -214,8 +246,7 @@ Not run: `cmake`/`ctest`, IPv6, non-Python origins, any benchmark (Phase 3).
 * A `HIT` copies the stored response out of the cache (one memcpy of up to the entry limit).
 * One global cache lock; `put` can do an O(n) sweep of expired entries when the cache is full.
 * Expiry is lazy: dead entries hold budget until looked up or swept. No `Age` header is emitted.
-* No `HEAD`, revalidation (`If-None-Match`), `Vary` handling, stale-while-revalidate, or
-  cost-aware eviction yet. No eviction counter yet (planned with observability).
+* No `HEAD`, revalidation (`If-None-Match`), `Vary` handling, or stale-while-revalidate.
 * Shutdown with the cache on: queued requests that would need a *new* upstream fetch get `503`
   while draining; hits are still served.
 * A worker is occupied for the whole upstream fetch (and up to 200 ms of lingering close), so

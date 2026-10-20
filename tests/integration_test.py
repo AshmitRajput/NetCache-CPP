@@ -226,11 +226,18 @@ class UpstreamFailureTests(Harness):
         cls.stop()
 
     def test_bad_upstream_responses_become_502(self):
-        for path in ("/chunked", "/truncated", "/reset", "/garbage", "/dupcl", "/nocl", "/cl_te"):
+        for path in ("/truncated", "/reset", "/garbage", "/dupcl", "/nocl", "/cl_te"):
             with self.subTest(path=path):
                 r = get(self.proxy_port, path)
                 self.assertEqual(status(r), 502, r[:80])
                 self.assertNotIn(b"0123456789", r)  # nothing of the broken body leaks through
+
+    def test_valid_chunked_upstream_response_is_decoded(self):
+        r = get(self.proxy_port, "/chunked")
+        self.assertEqual(status(r), 200)
+        self.assertEqual(body(r), b"hello world")
+        self.assertEqual(hvals(r, "content-length"), ["11"])
+        self.assertEqual(hvals(r, "connection"), ["close"])
 
     def test_oversized_response_is_502(self):
         self.assertEqual(status(get(self.proxy_port, "/size?n=5000")), 502)
@@ -469,11 +476,12 @@ class CacheBehaviourTests(Harness):
         self.assertEqual(self.n(p), 6)
 
     def test_upstream_errors_are_not_cached(self):
-        for path in ("/truncated", "/chunked", "/garbage"):
+        for path in ("/truncated", "/garbage"):
             with self.subTest(path):
                 self.assertEqual([status(get(self.proxy_port, path)) for _ in range(2)], [502, 502])
                 self.assertEqual(self.n(path), 2)
-        self.assertNotIn(b"X-Cache", get(self.proxy_port, "/chunked"))  # error pages carry no cache label
+        chunked = get(self.proxy_port, "/chunked")
+        self.assertEqual((status(chunked), xcache(chunked)), (200, "BYPASS"))
 
     def test_stats_counters_match_traffic(self):
         before = stats(self.proxy_port)

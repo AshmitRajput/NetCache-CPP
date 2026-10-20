@@ -184,6 +184,20 @@ TEST(response_empty_reason_phrase_ok) {
     CHECK(r.state == ParseState::Complete);
 }
 
+TEST(response_chunked_is_supported_and_decoded_strictly) {
+    auto head = parseResponseHead(resp("HTTP/1.1 200 OK", "Transfer-Encoding: chunked\r\n"));
+    CHECK(head.state == ParseState::Complete);
+    CHECK(head.head.framing == Framing::Chunked);
+    auto decoded = decodeChunkedBody("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", 100);
+    CHECK(decoded.state == ParseState::Complete);
+    CHECK_EQ(decoded.body, std::string("hello world"));
+    CHECK_EQ(decoded.consumed, size_t(26));
+    auto extension = decodeChunkedBody("5;ext=1\r\nhello\r\n0\r\n\r\n", 100);
+    CHECK(extension.state == ParseState::Error);
+    auto trailer = decodeChunkedBody("5\r\nhello\r\n0\r\nX: y\r\n\r\n", 100);
+    CHECK(trailer.state == ParseState::Error);
+}
+
 TEST(response_byte_at_a_time_never_completes_early) {
     std::string raw = resp("HTTP/1.1 200 OK", "Content-Length: 3\r\n");
     for (size_t n = 0; n < raw.size(); ++n) CHECK(parseResponseHead(std::string_view(raw).substr(0, n)).state == ParseState::NeedMore);
@@ -198,7 +212,8 @@ TEST(response_rejection_table) {
         std::string raw;
     };
     const std::vector<Case> cases = {
-        {"chunked", resp("HTTP/1.1 200 OK", "Transfer-Encoding: chunked\r\n")},
+        {"duplicate Transfer-Encoding", resp("HTTP/1.1 200 OK", "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n")},
+        {"unsupported Transfer-Encoding", resp("HTTP/1.1 200 OK", "Transfer-Encoding: gzip\r\n")},
         {"chunked + content-length", resp("HTTP/1.1 200 OK", "Content-Length: 5\r\nTransfer-Encoding: chunked\r\n")},
         {"duplicate Content-Length, same value", resp("HTTP/1.1 200 OK", "Content-Length: 5\r\nContent-Length: 5\r\n")},
         {"duplicate Content-Length, different", resp("HTTP/1.1 200 OK", "Content-Length: 5\r\nContent-Length: 6\r\n")},
