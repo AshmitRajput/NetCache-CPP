@@ -48,6 +48,7 @@ struct Fetched {
     std::shared_ptr<const std::string> payload;  // required when status == Ok
     bool cacheable = false;                      // meaningful when status == Ok
     Cache::Duration ttl{};                       // meaningful when cacheable
+    Cache::Duration fetch_cost{};                // measured upstream fetch duration
     std::string detail;                          // logs only
 };
 

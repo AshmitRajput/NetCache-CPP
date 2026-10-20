@@ -1,6 +1,7 @@
 #include "http.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <optional>
 
 namespace netcache::http {
@@ -276,17 +277,23 @@ ResponseParseResult parseResponseHead(std::string_view buf, const ResponseLimits
     std::vector<Header> headers;
     if (auto f = parseHeaderLines(head.substr(firstEol + 2), lim.maxHeaders, headers)) return fail(f->detail);
 
-    if (countHeader(headers, "transfer-encoding") > 0) {
-        return fail("unsupported framing: Transfer-Encoding");
-    }
+    size_t teCount = countHeader(headers, "transfer-encoding");
     size_t clCount = countHeader(headers, "content-length");
     if (clCount > 1) return fail("multiple Content-Length headers");
+    if (teCount > 1) return fail("multiple Transfer-Encoding headers");
 
     ResponseHead& h = r.head;
     h.status = status;
     h.reason = std::string(reason);
     if (status == 204 || status == 304) {
+        if (teCount != 0 || clCount != 0) return fail("body framing is not allowed for this status");
         h.framing = Framing::NoBody;
+        h.contentLength = 0;
+    } else if (teCount == 1) {
+        if (clCount != 0 || toLower(findHeader(headers, "transfer-encoding")->value) != "chunked") {
+            return fail("unsupported or ambiguous Transfer-Encoding");
+        }
+        h.framing = Framing::Chunked;
         h.contentLength = 0;
     } else {
         if (clCount == 0) return fail("unsupported framing: no Content-Length");
@@ -301,6 +308,61 @@ ResponseParseResult parseResponseHead(std::string_view buf, const ResponseLimits
     r.state = ParseState::Complete;
     r.consumed = term + 4;
     return r;
+}
+
+ChunkedDecodeResult decodeChunkedBody(std::string_view buffer, std::size_t maxBodyBytes) {
+    ChunkedDecodeResult result;
+    std::size_t pos = 0;
+    auto fail = [&result](std::string detail) {
+        result.state = ParseState::Error;
+        result.errorDetail = std::move(detail);
+        return result;
+    };
+    for (;;) {
+        std::size_t lineEnd = buffer.find("\r\n", pos);
+        if (lineEnd == std::string_view::npos) {
+            if (buffer.size() - pos > 32) return fail("chunk size line is too long");
+            return result;
+        }
+
+        std::string_view line = buffer.substr(pos, lineEnd - pos);
+        if (line.empty()) return fail("empty chunk size");
+        std::size_t semicolon = line.find(';');
+        if (semicolon != std::string_view::npos) return fail("chunk extensions are not supported");
+        if (line.size() > 16 || !std::all_of(line.begin(), line.end(), isHex)) {
+            return fail("invalid chunk size");
+        }
+        std::size_t chunkSize = 0;
+        for (char c : line) {
+            unsigned digit = c <= '9' ? static_cast<unsigned>(c - '0')
+                                      : static_cast<unsigned>((c >= 'a' ? c - 'a' : c - 'A') + 10);
+            if (chunkSize > (std::numeric_limits<std::size_t>::max() - digit) / 16) {
+                return fail("chunk size overflow");
+            }
+            chunkSize = chunkSize * 16 + digit;
+        }
+        pos = lineEnd + 2;
+        if (chunkSize == 0) {
+            if (buffer.size() - pos < 2) return result;
+            if (buffer.substr(pos, 2) != "\r\n") return fail("chunk trailers are not supported");
+            result.state = ParseState::Complete;
+            result.consumed = pos + 2;
+            return result;
+        }
+        if (result.body.size() > maxBodyBytes || chunkSize > maxBodyBytes - result.body.size()) {
+            return fail("decoded response exceeds the maximum allowed size");
+        }
+        if (buffer.size() - pos < chunkSize) return result;
+        result.body.append(buffer.substr(pos, chunkSize));
+        pos += chunkSize;
+        if (buffer.size() - pos < 2) return result;
+        if (buffer.substr(pos, 2) != "\r\n") return fail("chunk data is not followed by CRLF");
+        pos += 2;
+    }
+}
+
+ChunkedDecodeResult decodeChunked(std::string_view buffer, std::size_t maxBodyBytes) {
+    return decodeChunkedBody(buffer, maxBodyBytes);
 }
 
 // ------------------------------------------------------------ construction
@@ -337,13 +399,18 @@ std::string buildClientResponse(const ResponseHead& head, std::string_view body)
 
     std::string out = "HTTP/1.1 " + std::to_string(head.status) + " " +
                       (head.reason.empty() ? reasonPhrase(head.status) : head.reason) + "\r\n";
+    bool hasContentLength = false;
     for (const auto& h : head.headers) {
         std::string n = toLower(h.name);
+        if (n == "content-length") hasContentLength = true;
         if (n != "content-length") {  // framing is never stripped, even if a peer lists it in Connection
             if (std::find(std::begin(kHopByHop), std::end(kHopByHop), n) != std::end(kHopByHop)) continue;
             if (std::find(listed.begin(), listed.end(), n) != listed.end()) continue;
         }
         out += h.name + ": " + h.value + "\r\n";
+    }
+    if (head.framing == Framing::Chunked && !hasContentLength) {
+        out += "Content-Length: " + std::to_string(body.size()) + "\r\n";
     }
     out += "Connection: close\r\n\r\n";
     out.append(body);

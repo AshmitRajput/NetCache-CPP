@@ -71,6 +71,7 @@ struct Config {
     unsigned coalesceWaitMs = 0;                // 0 = upstream timeout + 2000
     bool enableStats = false;
     bool coalesce = true;
+    netcache::EvictionKind eviction = netcache::EvictionKind::Lru;
 };
 
 void printUsage(const char* prog) {
@@ -92,6 +93,7 @@ void printUsage(const char* prog) {
                  "  --max-ttl-s N            clamp for any TTL (default 3600)\n"
                  "  --coalesce-wait-ms N     max time a request waits for another's fetch (default upstream timeout + 2000)\n"
                  "  --no-coalesce            disable request coalescing (for experiments)\n"
+                 "  --eviction KIND         lru or cost-aware (default lru)\n"
                  "  --enable-stats           serve JSON counters at /__netcache/stats (off by default)\n",
                  prog);
 }
@@ -163,6 +165,13 @@ bool parseArgs(int argc, char** argv, Config& cfg) {
             cfg.coalesceWaitMs = static_cast<unsigned>(v);
         } else if (a == "--no-coalesce") {
             cfg.coalesce = false;
+        } else if (a == "--eviction") {
+            const char* s = next();
+            ok = s != nullptr;
+            if (ok && std::string(s) == "lru") cfg.eviction = netcache::EvictionKind::Lru;
+            else if (ok && (std::string(s) == "cost" || std::string(s) == "cost-aware"))
+                cfg.eviction = netcache::EvictionKind::CostAware;
+            else ok = false;
         } else if (a == "--enable-stats") {
             cfg.enableStats = true;
         } else {
@@ -395,8 +404,26 @@ FetchResult fetchUpstream(const UpstreamContext& up, const netcache::http::Reque
 
     res.head = std::move(pr.head);
     res.body = buf.substr(pr.consumed);
-    if (res.body.size() > res.head.contentLength) res.body.resize(res.head.contentLength);  // ignore trailing bytes
-    while (res.body.size() < res.head.contentLength) {
+    if (res.head.framing == http::Framing::Chunked) {
+        for (;;) {
+            http::ChunkedDecodeResult decoded = http::decodeChunkedBody(res.body, up.cfg.maxResponseBytes);
+            if (decoded.state == http::ParseState::Error) return failure(decoded.errorDetail);
+            if (decoded.state == http::ParseState::Complete) {
+                res.body = std::move(decoded.body);
+                break;
+            }
+            size_t n = 0;
+            switch (recvSome(fd.get(), tmp, sizeof tmp, deadline, n)) {
+                case Io::Ok: res.body.append(tmp, n); break;
+                case Io::Timeout: return timedOutResult("upstream timed out waiting for chunked body");
+                case Io::Closed: return failure("upstream closed before complete chunked body");
+                case Io::Error: return failure("upstream read error while reading chunked body");
+            }
+        }
+    } else {
+        if (res.body.size() > res.head.contentLength) res.body.resize(res.head.contentLength);
+    }
+    while (res.head.framing == http::Framing::ContentLength && res.body.size() < res.head.contentLength) {
         size_t n = 0;
         switch (recvSome(fd.get(), tmp, std::min(sizeof tmp, res.head.contentLength - res.body.size()), deadline, n)) {
             case Io::Ok: res.body.append(tmp, n); break;
@@ -494,7 +521,9 @@ std::string statsResponse(const UpstreamContext& up) {
                        ",\"upstream_timeouts\":" + n(c.upstream_timeouts) + ",\"wait_timeouts\":" + n(c.wait_timeouts) +
                        ",\"cancelled\":" + n(c.cancelled) + ",\"upstream_fetches\":" + n(c.fetches_started) +
                        ",\"entries\":" + n(cs.entries) + ",\"payload_bytes\":" + n(cs.payload_bytes) +
-                       ",\"max_bytes\":" + n(cs.max_bytes) + ",\"max_entry_bytes\":" + n(cs.max_entry_bytes) + "}\n";
+                       ",\"max_bytes\":" + n(cs.max_bytes) + ",\"max_entry_bytes\":" + n(cs.max_entry_bytes) +
+                       ",\"evictions\":" + n(cs.evictions) + ",\"expirations\":" + n(cs.expirations) +
+                       ",\"rejected_puts\":" + n(cs.rejected_puts) + "}\n";
     return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: " +
            std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
 }
@@ -553,8 +582,10 @@ void handleConnection(int rawFd, UpstreamContext& up) {
     // 3. Forward / cache. One fetch callback serves every path: it fetches, serializes the client
     //    response once, and decides cacheability with the pure policy function.
     auto fetchFn = [&]() -> netcache::Fetched {
+        auto fetchStart = Clock::now();
         FetchResult fr = fetchUpstream(up, pr.request);
         netcache::Fetched f;
+        f.fetch_cost = std::chrono::duration_cast<netcache::Cache::Duration>(Clock::now() - fetchStart);
         f.detail = fr.detail;
         switch (fr.status) {
             case FetchStatus::Ok: {
@@ -710,6 +741,7 @@ int main(int argc, char** argv) {
         netcache::Cache::Config cc;
         cc.max_bytes = cfg.cacheBytes;
         cc.max_entry_bytes = cfg.cacheEntryBytes;
+        cc.eviction = cfg.eviction;
         up.cache = std::make_unique<netcache::Cache>(cc);
         netcache::CoalescingCache::Options co;
         co.coalesce = cfg.coalesce;

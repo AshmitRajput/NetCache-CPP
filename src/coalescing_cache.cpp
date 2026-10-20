@@ -82,7 +82,9 @@ LookupResult CoalescingCache::runFetch(const std::string& key, const FetchFn& fe
             out.outcome = Outcome::MissUncacheable;
             if (f.cacheable) {
                 try {
-                    if (cache_.put(key, std::string(*f.payload), f.ttl)) out.outcome = Outcome::MissStored;
+                    if (cache_.put(key, std::string(*f.payload), f.ttl, f.fetch_cost)) {
+                        out.outcome = Outcome::MissStored;
+                    }
                 } catch (...) {  // e.g. bad_alloc while storing: still a valid response, just not cached
                     out.detail = "cache insert failed";
                 }

@@ -45,7 +45,7 @@ RequestParseResult parseRequest(std::string_view buffer, const RequestLimits& li
 // --------------------------------------------------------------- responses
 
 // Phase 3 adds Chunked here.
-enum class Framing { ContentLength, NoBody };
+enum class Framing { ContentLength, Chunked, NoBody };
 
 struct ResponseLimits {
     size_t maxHeaderBytes = 16 * 1024;
@@ -69,6 +69,18 @@ struct ResponseParseResult {
 };
 
 ResponseParseResult parseResponseHead(std::string_view buffer, const ResponseLimits& limits = {});
+
+struct ChunkedDecodeResult {
+    ParseState state = ParseState::NeedMore;
+    std::string errorDetail;
+    std::size_t consumed = 0;
+    std::string body;
+};
+
+// Strict chunked decoder. Extensions and trailers are rejected; `consumed` ends immediately
+// after the empty line terminating the zero-size chunk.
+ChunkedDecodeResult decodeChunkedBody(std::string_view buffer, std::size_t maxBodyBytes);
+ChunkedDecodeResult decodeChunked(std::string_view buffer, std::size_t maxBodyBytes);
 
 // ------------------------------------------------------------ construction
 
